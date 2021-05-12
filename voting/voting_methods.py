@@ -18,7 +18,7 @@ from numba import jit
    * implement tie-breaking and PUT for Hare and other iterative methods
    * to optimize the iterative methods, I am currently using the private compiled methods
      _borda_score and _find_updated_profiles. We should think of a better way to deal with this issue. 
-   * implement other voting methods: e.g., Dodgson
+   * implement other voting methods: e.g., Dodgson, Young, Kemeny
    * implement the linear programming version of Ranked Pairs: https://arxiv.org/pdf/1805.06992.pdf
    * implement a Voting Method class?
 '''
@@ -171,7 +171,7 @@ def anti_plurality(profile):
 # Iterative Methods
 #####
 
-@vm_name("Ranked Choice")
+@vm_name("Instant Runoff")
 def hare(profile):
     """If there is a majority winner then that candidate is the ranked choice winner
     If there is no majority winner, then remove all candidates that are ranked first by the fewest 
@@ -181,7 +181,7 @@ def hare(profile):
     Note: If there is  more than one candidate with the fewest number of first-place votes, then *all*
     such candidates are removed from the profile. 
     
-    Note: We typically refer to this method as "Ranked Choice", but it also known as "Hare" or "IRV"
+    Note: This is known as "Ranked Choice", "Hare", "IRV", "Alternative Voter" or "STV" 
     """
     
     num_cands = profile.num_cands   
@@ -212,13 +212,86 @@ def hare(profile):
      
     return sorted(winners)
 
+@vm_name("Instant Runoff TB")
+def hare_tb(profile, tie_breaker = None):
+    """If there is a majority winner then that candidate is the ranked choice winner
+    If there is no majority winner, then remove all candidates that are ranked first by the fewest 
+    number of voters.  Continue removing candidates with the fewest number first-place votes until 
+    there is a candidate with a majority of first place votes.  
+    
+    Note: If there is  more than one candidate with the fewest number of first-place votes, then *all*
+    such candidates are removed from the profile. 
+    
+    Note: This is known as "Ranked Choice", "Hare", "IRV", "Alternative Voter" or "STV" 
+    """
+    # the tie_breaker is any linear order (i.e., list) of the candidates
+    tb = tie_breaker if tie_breaker is not None else list(range(profile.num_cands))
+    
+    num_cands = profile.num_cands   
+    candidates = profile.candidates
+    strict_maj_size = profile.strict_maj_size()
+    
+    rs, rcounts = profile.rankings_counts # get all the ranking data
+    
+    cands_to_ignore = np.empty(0)
+
+    winners = [c for c in candidates 
+               if _num_rank_first(rs, rcounts, cands_to_ignore, c) >= strict_maj_size]
+
+    while len(winners) == 0:
+        plurality_scores = {c: _num_rank_first(rs, rcounts, cands_to_ignore, c) for c in candidates 
+                            if  not isin(cands_to_ignore,c)}  
+        min_plurality_score = min(plurality_scores.values())
+        lowest_first_place_votes = np.array([c for c in plurality_scores.keys() 
+                                             if  plurality_scores[c] == min_plurality_score])
+        
+        cand_to_remove = lowest_first_place_votes[0]
+        for c in lowest_first_place_votes[1:]: 
+            if tb.index(c) < tb.index(cand_to_remove):
+                cand_to_remove = c
+
+        # remove cands with lowest plurality winners
+        cands_to_ignore = np.concatenate((cands_to_ignore, cand_to_remove), axis=None)
+        if len(cands_to_ignore) == num_cands: #all the candidates where removed
+            winners = sorted(lowest_first_place_votes)
+        else:
+            winners = [c for c in candidates 
+                       if not isin(cands_to_ignore,c) and _num_rank_first(rs, rcounts, cands_to_ignore, c) >= strict_maj_size]
+     
+    return sorted(winners)
+
+@vm_name("Instant Runoff PUT")
+def hare_put(profile):
+    """Instant Runoff with parallel universe tie-breaking (PUT).  Apply the Instant Runoff method with a tie-breaker
+    for each possible linear order over the candidates. 
+    
+    Warning: This will take a long time on profiles with many candidates."""
+    
+    candidates = profile.candidates
+    strict_maj_size = profile.strict_maj_size()
+    
+    rs, rcounts = profile.rankings_counts # get all the ranking data
+    
+    winners = [c for c in candidates 
+               if _num_rank_first(rs, rcounts, np.empty(0), c) >= strict_maj_size]
+
+    if len(winners) == 0:
+        # run Instant Runoff with tie-breaker for each permulation of candidates
+        for tb in permutations(candidates):
+            winners += hare_tb(profile, tie_breaker = tb) 
+
+    return sorted(list(set(winners)))
+
 @vm_name("PluralityWRunoff")
 def plurality_with_runoff(profile):
     """If there is a majority winner then that candidate is the plurality with runoff winner
     If there is no majority winner, then hold a runoff with  the top two candidates: 
     either two (or more candidates)  with the most first place votes or the candidate with 
     the most first place votes and the candidate with the 2nd highest first place votes 
-    are ranked first by the fewest number of voters.    
+    are ranked first by the fewest number of voters.  
+    
+    A candidate is a Plurality with Runoff winner if it is a winner in a runoff between two pairs of 
+    first- or second- ranked candidates. 
     
     Note: If the candidates are all tied for the most first place votes, then all candidates are winners. 
     """
@@ -232,25 +305,73 @@ def plurality_with_runoff(profile):
     max_plurality_score = max(plurality_scores.values())
     
     first = [c for c in candidates if plurality_scores[c] == max_plurality_score]
-    
-    if len(first) > 1:
-        runoff_candidates = first
-    else:
-        # find the 2nd highest plurality score
+    second = list()
+    if len(first) == 1:
         second_plurality_score = list(reversed(sorted(plurality_scores.values())))[1]
         second = [c for c in candidates if plurality_scores[c] == second_plurality_score]
-        runoff_candidates = first + second
-        
-    runoff_candidates = np.array(runoff_candidates)
-    candidates_to_ignore = np.array([c for c in candidates if not isin(runoff_candidates,c)])
+       
+    
+    #print("runoff ", runoff_candidates)
+    
+    if len(second) > 0:
+        all_runoff_pairs = product(first, second)
+    else: 
+        all_runoff_pairs = [(c1,c2) for c1,c2 in product(first, first) if c1 != c2]
 
-    runoff_plurality_scores = {c: _num_rank_first(rs, rcounts, candidates_to_ignore, c) for c in candidates 
-                               if isin(runoff_candidates,c)} 
+    winners = list()
+    for c1, c2 in all_runoff_pairs: 
+        
+        if profile.margin(c1,c2) > 0:
+            winners.append(c1)
+        elif profile.margin(c1,c2) < 0:
+            winners.append(c2)
+        elif profile.margin(c1,c2) == 0:
+            winners.append(c1)
+            winners.append(c2)
     
-    runoff_max_plurality_score = max(runoff_plurality_scores.values())
+    return sorted(list(set(winners)))
+####
+# Removed following version of Plurality with Runoff that deals with ties differently than the one above
+#
+# @vm_name("PluralityWRunoff")
+# def plurality_with_runoff(profile):
+#     """If there is a majority winner then that candidate is the plurality with runoff winner
+#     If there is no majority winner, then hold a runoff with  the top two candidates: 
+#     either two (or more candidates)  with the most first place votes or the candidate with 
+#     the most first place votes and the candidate with the 2nd highest first place votes 
+#     are ranked first by the fewest number of voters.    
     
-    return sorted([c for c in runoff_plurality_scores.keys() 
-                   if runoff_plurality_scores[c] == runoff_max_plurality_score])
+#     Note: If the candidates are all tied for the most first place votes, then all candidates are winners. 
+#     """
+    
+#     candidates = profile.candidates
+#     rs, rcounts = profile.rankings_counts # get all the ranking data
+    
+#     cands_to_ignore = np.empty(0)
+#     plurality_scores = profile.plurality_scores()  
+
+#     max_plurality_score = max(plurality_scores.values())
+    
+#     first = [c for c in candidates if plurality_scores[c] == max_plurality_score]
+    
+#     if len(first) > 1:
+#         runoff_candidates = first
+#     else:
+#         # find the 2nd highest plurality score
+#         second_plurality_score = list(reversed(sorted(plurality_scores.values())))[1]
+#         second = [c for c in candidates if plurality_scores[c] == second_plurality_score]
+#         runoff_candidates = first + second
+        
+#     runoff_candidates = np.array(runoff_candidates)
+#     candidates_to_ignore = np.array([c for c in candidates if not isin(runoff_candidates,c)])
+
+#     runoff_plurality_scores = {c: _num_rank_first(rs, rcounts, candidates_to_ignore, c) for c in candidates 
+#                                if isin(runoff_candidates,c)} 
+    
+#     runoff_max_plurality_score = max(runoff_plurality_scores.values())
+    
+#     return sorted([c for c in runoff_plurality_scores.keys() 
+#                    if runoff_plurality_scores[c] == runoff_max_plurality_score])
 
 @vm_name("Coombs")
 def coombs(profile):
@@ -293,6 +414,50 @@ def coombs(profile):
 
     return sorted(winners)
 
+@vm_name("Coombs")
+def coombs_with_data(profile):
+    """If there is a majority winner then that candidate is the Coombs winner
+    If there is no majority winner, then remove all candidates that are ranked last by the greatest 
+    number of voters.  Continue removing candidates with the most last-place votes until 
+    there is a candidate with a majority of first place votes.  
+    
+    Note: If there is  more than one candidate with the most number of last-place votes, then *all*
+    such candidates are removed from the profile. 
+    
+    Returns the order of elimination
+    """
+    
+    num_cands = profile.num_cands   
+    candidates = profile.candidates
+    strict_maj_size = profile.strict_maj_size()
+    
+    rs, rcounts = profile.rankings_counts # get all the ranking data
+    
+    cands_to_ignore = np.empty(0)
+
+    winners = [c for c in candidates 
+               if _num_rank_first(rs, rcounts, cands_to_ignore, c) >= strict_maj_size]
+
+    elims_list = list()
+    while len(winners) == 0:
+        
+        last_place_scores = {c: _num_rank_last(rs, rcounts, cands_to_ignore, c) for c in candidates 
+                             if not isin(cands_to_ignore,c)}  
+        max_last_place_score = max(last_place_scores.values())
+        greatest_last_place_votes = np.array([c for c in last_place_scores.keys() 
+                                              if  last_place_scores[c] == max_last_place_score])
+
+        elims_list.append(list(greatest_last_place_votes))
+        # remove candidates ranked last by the greatest number of voters
+        cands_to_ignore = np.concatenate((cands_to_ignore, greatest_last_place_votes), axis=None)
+        
+        if len(cands_to_ignore) == num_cands:
+            winners = list(greatest_last_place_votes)
+        else:
+            winners = [c for c in candidates 
+                       if not isin(cands_to_ignore,c) and _num_rank_first(rs, rcounts, cands_to_ignore, c) >= strict_maj_size]
+
+    return sorted(winners), elims_list
 ###
 # Variations of Coombs with tie-breaking, parallel universe tie-breaking
 ##
@@ -419,6 +584,143 @@ def baldwin(profile):
             updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
     return sorted(winners)
 
+
+@vm_name("Baldwin")
+def baldwin_with_data(profile):
+    """Iteratively remove all candidates with the lowest Borda score until a single 
+    candidate remains.   If, at any stage, all  candidates have the same Borda score, 
+    then all (remaining) candidates are winners.
+    """
+
+    num_cands = profile.num_cands   
+    candidates = profile.candidates
+    strict_maj_size = profile.strict_maj_size()
+    
+    rs, rcounts = profile.rankings_counts # get all the ranking data
+    
+    cands_to_ignore = np.empty(0)
+    
+    elims_list = list()
+
+    borda_scores = {c: _borda_score(rs, rcounts, num_cands, c) for c in candidates}
+
+    min_borda_score = min(list(borda_scores.values()))
+    
+    last_place_borda_scores = [c for c in candidates 
+                               if c in borda_scores.keys() and borda_scores[c] == min_borda_score]
+     
+    elims_list.append(last_place_borda_scores)
+    cands_to_ignore = np.concatenate((cands_to_ignore, last_place_borda_scores), axis=None)
+    
+    winners = list()
+    if cands_to_ignore.shape[0] ==  num_cands: # call candidates have lowest Borda score
+        winners = sorted(last_place_borda_scores)
+    else: # remove the candidates with lowest Borda score
+        updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
+    while len(winners) == 0:
+        borda_scores = {c: _borda_score(updated_profile, rcounts, num_cands - cands_to_ignore.shape[0], c) 
+                        for c in candidates if not isin(cands_to_ignore,c)}
+                
+        min_borda_score = min(borda_scores.values())
+        last_place_borda_scores = [c for c in borda_scores.keys() if borda_scores[c] == min_borda_score]
+        
+        elims_list.append(last_place_borda_scores)
+        cands_to_ignore = np.concatenate((cands_to_ignore, last_place_borda_scores), axis=None)
+                
+        if cands_to_ignore.shape[0] == num_cands: # removed all remaining candidates
+            winners = sorted(last_place_borda_scores)
+        elif num_cands - cands_to_ignore.shape[0] ==  1: # only one candidate remains
+            winners = sorted([c for c in candidates if c not in cands_to_ignore])
+        else: 
+            updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
+    return sorted(winners), elims_list
+
+
+
+@vm_name("Baldwin TB")
+def baldwin_tb(profile, tie_breaker=None):
+    """Iteratively remove all candidates with the lowest Borda score until a single 
+    candidate remains.   If, at any stage, all  candidates have the same Borda score, 
+    then all (remaining) candidates are winners.
+
+    The tie-breaking rule is any linear order (i.e., list) of the candidates.  The default rule 
+    is to order the candidates as follows: 0,....,num_cands-1
+
+    """
+    
+    # the tie_breaker is any linear order (i.e., list) of the candidates
+    tb = tie_breaker if tie_breaker is not None else list(range(profile.num_cands))
+
+    num_cands = profile.num_cands   
+    candidates = profile.candidates
+    strict_maj_size = profile.strict_maj_size()
+    
+    rs, rcounts = profile.rankings_counts # get all the ranking data
+    
+    cands_to_ignore = np.empty(0)
+
+    borda_scores = {c: _borda_score(rs, rcounts, num_cands, c) for c in candidates}
+
+    min_borda_score = min(list(borda_scores.values()))
+    
+    last_place_borda_scores = [c for c in candidates 
+                               if c in borda_scores.keys() and borda_scores[c] == min_borda_score]
+      
+    cand_to_remove = last_place_borda_scores[0]
+    for c in last_place_borda_scores[1:]: 
+        if tb.index(c) < tb.index(cand_to_remove):
+            cand_to_remove = c
+    cands_to_ignore = np.concatenate((cands_to_ignore, np.array([cand_to_remove])), axis=None)
+    
+    winners = list()
+    if cands_to_ignore.shape[0] ==  num_cands: # call candidates have lowest Borda score
+        winners = sorted(last_place_borda_scores)
+    else: # remove the candidates with lowest Borda score
+        updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
+    while len(winners) == 0:
+        borda_scores = {c: _borda_score(updated_profile, rcounts, num_cands - cands_to_ignore.shape[0], c) 
+                        for c in candidates if not isin(cands_to_ignore,c)}
+                
+        min_borda_score = min(borda_scores.values())
+        last_place_borda_scores = [c for c in borda_scores.keys() if borda_scores[c] == min_borda_score]
+        
+        # select the candidate to remove using the tie-breaking rule (a linear order over the candidates)
+        cand_to_remove = last_place_borda_scores[0]
+        for c in last_place_borda_scores[1:]: 
+            if tb.index(c) < tb.index(cand_to_remove):
+                cand_to_remove = c
+        
+        cands_to_ignore = np.concatenate((cands_to_ignore, np.array([cand_to_remove])), axis=None)
+                
+        if cands_to_ignore.shape[0] == num_cands: # removed all remaining candidates
+            winners = sorted(last_place_borda_scores)
+        elif num_cands - cands_to_ignore.shape[0] ==  1: # only one candidate remains
+            winners = sorted([c for c in candidates if c not in cands_to_ignore])
+        else: 
+            updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
+    return sorted(winners)
+
+@vm_name("Baldwin PUT")
+def baldwin_put(profile):
+    """Baldwin with parallel universe tie-breaking (PUT).  Apply the baldwin method with a tie-breaker
+    for each possible linear order over the candidates. 
+    
+    Warning: This will take a long time on profiles with many candidates."""
+    
+    candidates = profile.candidates    
+    cw = profile.condorcet_winner()
+    
+    winners = list() if cw is None else [cw]
+
+    if len(winners) == 0:
+        # run Coombs with tie-breaker for each permulation of candidates
+        for tb in permutations(candidates):
+            winners += baldwin_tb(profile, tie_breaker = tb) 
+
+    return sorted(list(set(winners)))
+
+#####
+
 @vm_name("Strict Nanson")
 def strict_nanson(profile):
     """Iteratively remove all candidates with the  Borda score strictly below the average Borda score
@@ -464,6 +766,56 @@ def strict_nanson(profile):
             updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
             
     return winners
+
+
+@vm_name("Strict Nanson")
+def strict_nanson_with_data(profile):
+    """Iteratively remove all candidates with the  Borda score strictly below the average Borda score
+    until one candidate remains.   If, at any stage, all  candidates have the same Borda score, 
+    then all (remaining) candidates are winners.
+    """
+
+    num_cands = profile.num_cands   
+    candidates = profile.candidates
+    strict_maj_size = profile.strict_maj_size()
+    
+    elims_list = list()
+    rs, rcounts = profile.rankings_counts # get all the ranking data
+    
+    cands_to_ignore = np.empty(0)
+
+    borda_scores = {c: _borda_score(rs, rcounts, num_cands, c) for c in candidates}
+    
+    avg_borda_score = np.mean(list(borda_scores.values()))
+    below_borda_avg_candidates = np.array([c for c in borda_scores.keys() if borda_scores[c] < avg_borda_score])
+    
+    elims_list.append(list(below_borda_avg_candidates))
+    cands_to_ignore = np.concatenate((cands_to_ignore, below_borda_avg_candidates), axis=None)
+    
+    if cands_to_ignore.shape[0] == num_cands:  # all candidates have same Borda score
+        winners = sorted(candidates)
+    else: 
+        winners = list()
+        updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
+    
+    while len(winners) == 0: 
+        
+        borda_scores = {c: _borda_score(updated_profile, rcounts, num_cands - cands_to_ignore.shape[0], c) 
+                        for c in candidates if not isin(cands_to_ignore,c)}
+        avg_borda_scores = np.mean(list(borda_scores.values()))
+    
+        below_borda_avg_candidates = np.array([c for c in borda_scores.keys() 
+                                               if borda_scores[c] < avg_borda_scores])
+        
+        elims_list.append(list(below_borda_avg_candidates))
+        cands_to_ignore = np.concatenate((cands_to_ignore, below_borda_avg_candidates), axis=None)
+                
+        if (below_borda_avg_candidates.shape[0] == 0) or ((num_cands - cands_to_ignore.shape[0]) == 1):
+            winners = sorted([c for c in candidates if c not in cands_to_ignore])
+        else:
+            updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
+            
+    return winners, elims_list
 
 
 @vm_name("Weak Nanson")
@@ -515,6 +867,106 @@ def weak_nanson(profile):
             
     return winners
 
+
+@vm_name("Weak Nanson")
+def weak_nanson_with_data(profile):
+    """Iteratively remove all candidates with the  Borda score less than or equal to the average Borda score
+    until one candidate remains.   If, at any stage, all  candidates have the same Borda score, 
+    then all (remaining) candidates are winners.
+    """
+
+    num_cands = profile.num_cands   
+    candidates = profile.candidates
+    strict_maj_size = profile.strict_maj_size()
+    elims_list = list()
+    rs, rcounts = profile.rankings_counts # get all the ranking data
+    
+    cands_to_ignore = np.empty(0)
+
+    borda_scores = {c: _borda_score(rs, rcounts, num_cands, c) for c in candidates}
+    
+    avg_borda_score = np.mean(list(borda_scores.values()))
+    below_borda_avg_candidates = np.array([c for c in borda_scores.keys() 
+                                           if borda_scores[c] <= avg_borda_score])
+    
+    elims_list.append(list(below_borda_avg_candidates))
+    
+    cands_to_ignore = np.concatenate((cands_to_ignore, below_borda_avg_candidates), axis=None)
+    
+    if cands_to_ignore.shape[0] == num_cands:  # all candidates have same Borda score
+        winners = sorted(candidates)
+    else: 
+        winners = list()
+        updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
+    
+    while len(winners) == 0: 
+        
+        borda_scores = {c: _borda_score(updated_profile, rcounts, num_cands - cands_to_ignore.shape[0], c) 
+                        for c in candidates if not isin(cands_to_ignore,c)}
+        avg_borda_scores = np.mean(list(borda_scores.values()))
+    
+        below_borda_avg_candidates = np.array([c for c in borda_scores.keys() 
+                                               if borda_scores[c] <= avg_borda_scores])
+        
+        elims_list.append(list(below_borda_avg_candidates))
+        cands_to_ignore = np.concatenate((cands_to_ignore, below_borda_avg_candidates), axis=None)
+                
+        if (num_cands - cands_to_ignore.shape[0]) == 0:
+            winners = sorted(below_borda_avg_candidates)
+        elif (num_cands - cands_to_ignore.shape[0]) == 1:
+            winners = sorted([c for c in candidates if c not in cands_to_ignore])
+        else:
+            updated_profile = _find_updated_profile(rs, cands_to_ignore, num_cands)
+            
+    return winners, elims_list
+
+@vm_name("Simplified Bucklin")
+def simplified_bucklin(profile): 
+    '''If a candidate has a strict majority of first-place votes, then that candidate is the winner. 
+    If no such candidate exists, then check the candidates that are ranked first or second.  If a candidate 
+    has a strict majority of first- or second-place voters, then that candidate is the winner. 
+    If no such winner is found move on to the 3rd, 4th, etc. place votes'''
+    
+    strict_maj_size = profile.strict_maj_size()
+    
+    ranks = range(1, profile.num_cands + 1)
+    
+    cand_to_num_voters_rank = dict()
+    for r in ranks:
+        cand_to_num_voters_rank[r] = {c: profile.num_rank(c, r) 
+                                for c in profile.candidates}
+        cand_scores = {c:sum([cand_to_num_voters_rank[_r][c] for _r in cand_to_num_voters_rank.keys()]) 
+                       for c in profile.candidates}
+        if any([s >= strict_maj_size for s in cand_scores.values()]):
+            break
+    
+    return sorted([c for c in profile.candidates if cand_scores[c] >= strict_maj_size])
+
+
+## TODO FIX>..
+@vm_name("Bucklin")
+def bucklin(profile): 
+    '''If a candidate has a strict majority of first-place votes, then that candidate is the winner. 
+    If no such candidate exists, then check the candidates that are ranked first or second.  If a candidate 
+    has a strict majority of first- or second-place voters, then that candidate is the winner. 
+    If no such winner is found move on to the 3rd, 4th, etc. place votes'''
+    
+    strict_maj_size = profile.strict_maj_size()
+    
+    ranks = range(1, profile.num_cands + 1)
+    
+    cand_to_num_voters_rank = dict()
+    for r in ranks:
+        cand_to_num_voters_rank[r] = {c: profile.num_rank(c, r) 
+                                for c in profile.candidates}
+        cand_scores = {c:sum([cand_to_num_voters_rank[_r][c] for _r in cand_to_num_voters_rank.keys()]) 
+                       for c in profile.candidates}
+        if any([s >= strict_maj_size for s in cand_scores.values()]):
+            break
+    
+    max_score = max(cand_scores.values())
+    return sorted([c for c in profile.candidates if cand_scores[c] >= max_score])
+
 ####
 # Majority Graph Invariant Methods
 #
@@ -549,6 +1001,16 @@ def has_cycle(mg):
     except:
         cycles = list()
     return len(cycles) != 0
+
+def does_create_cycle(g, edge):
+    '''return True if adding the edge to g create a cycle.
+    it is assumed that edge is already in g'''
+    source = edge[0]
+    target = edge[1]
+    for n in g.predecessors(source):
+        if nx.has_path(g, target, n): 
+            return True
+    return False
 
 def unbeaten_candidates(mg): 
     """the set of candidates with no incoming arrows, i.e., the 
@@ -652,12 +1114,20 @@ def llull_mg(mg):
 ## Uncovered Set
 
 def left_covers(dom, c1, c2):
-    # c1 left covers c2 when all the candidates that are majority preferred to c1
-    # are also majority preferred to c2. 
-    #
-    # dom is a dictionary listing for each candidate, the set of candidates majority 
-    # prefeerred to that candidate. 
+    # left covers: c1 left covers c2 when all the candidates that are majority preferred to c1
+    # are also majority preferred to c2.
+    
+    # weakly left covers: c1 weakly left covers c2 when all the candidates that are majority preferred to or tied with c1
+    # are also majority preferred to or tied with c2.
+    
     return dom[c1].issubset(dom[c2])
+
+def right_covers(dom, c1, c2):
+    # right covers: c1 right covers c2 when all the candidates that c2  majority preferrs are majority
+    # preferred by c1
+      
+    return dom[c2].issubset(dom[c1])
+
 
 @vm_name("Uncovered Set")
 def uc_gill_mg(mg): 
@@ -705,28 +1175,115 @@ def uc_fish_mg(mg):
             uc_set.append(c1)
     return list(sorted(uc_set))
                 
-@vm_name("Uncovered Set - Fishburn")
+@vm_name("UC Fishburn")
 def uc_fish(profile): 
     """See the explaination of uc_fish_mg"""
     
     mg = profile.margin_graph() 
     return uc_fish_mg(mg)
 
-@vm_name("GETCHA")
+
+@vm_name("UC Bordes")
+def uc_bordes_mg(mg): 
+    """Bordes version: a Bordes covers b if a is majority preferred to b and for all c, if c is 
+    majority preferred or tied with a, then c is majority preferred to tied with b. Returns the candidates
+    that are not Bordes covered. 
+
+    """
+
+    dom = {n: set(mg.predecessors(n)).union([_n for _n in mg.nodes 
+                                             if (not mg.has_edge(n, _n) and not mg.has_edge(_n, n))]) 
+           for n in mg.nodes}
+    
+    uc_set = list()
+    for c1 in mg.nodes:
+        is_in_ucs = True
+        for c2 in mg.predecessors(c1): # consider only c2 predecessors
+            if c1 != c2:
+                # check if c2 left covers  c1 
+                if left_covers(dom, c2, c1):
+                    is_in_ucs = False
+        if is_in_ucs:
+            uc_set.append(c1)
+    return list(sorted(uc_set))  
+
+@vm_name("UC Bordes")
+def uc_bordes(profile): 
+    '''
+    See explanation for uc_bordes_mg 
+    '''
+    mg = profile.margin_graph() 
+    return uc_bordes_mg(mg)
+    
+@vm_name("UC McKelvey")
+def uc_mckelvey_mg(mg): 
+    """McKelvey version: a McKelvey covers b if a Gillies covers b and a Bordes covers b. Returns the candidates
+    that are not McKelvey covered. 
+
+    """
+    weak_dom = {n: set(mg.predecessors(n)).union([_n for _n in mg.nodes 
+                                                  if (not mg.has_edge(n, _n) and not mg.has_edge(_n, n))]) 
+                for n in mg.nodes}
+    strict_dom = {n: set(mg.predecessors(n)) for n in mg.nodes}    
+    uc_set = list()
+    for c1 in mg.nodes:
+        is_in_ucs = True
+        for c2 in mg.predecessors(c1): # consider only c2 predecessors
+            if c1 != c2:
+                # check if c2 left covers  c1 
+                if left_covers(strict_dom, c2, c1) and left_covers(weak_dom, c2, c1):
+                    is_in_ucs = False
+        if is_in_ucs:
+            uc_set.append(c1)
+    return list(sorted(uc_set))      
+   
+@vm_name("UC McKelvey")
+def uc_mckelvey(profile): 
+    mg = profile.margin_graph() 
+    return uc_mckelvey_mg(mg)
+
+### Same as UC Bordes
+#@vm_name("UC Right Covers")
+#def uc_right_covers_mg(mg): 
+#    """Right covers
+#
+#    """
+#    
+#    dom = {n: set(mg.successors(n)) for n in mg.nodes}
+#    
+#    uc_set = list()
+#    for c1 in mg.nodes:
+#        is_in_ucs = True
+#        for c2 in mg.predecessors(c1): # consider only c2 predecessors
+#            if c1 != c2:
+#                # check if c2 right covers  c1 
+#                if right_covers(dom, c2, c1):
+#                    is_in_ucs = False
+#        if is_in_ucs:
+#            uc_set.append(c1)
+#    return list(sorted(uc_set))    
+#   
+#@vm_name("UC Right Covers")
+#def uc_right_covers(profile): 
+#    mg = profile.margin_graph() 
+#    return uc_right_covers_mg(mg)
+#  
+#####
+
+@vm_name("Top Cycle")
 def getcha_mg(mg):
     """The smallest set of candidates such that every candidate inside the set 
-    is majority preferred to every candidate outside the set.  Also known as the Smith set.
+    is majority preferred to every candidate outside the set.  Also known as GETCHA or the Smith set.
     """
     min_indegree = min([max([mg.in_degree(n) for n in comp]) for comp in nx.strongly_connected_components(mg)])
     smith = [comp for comp in nx.strongly_connected_components(mg) if max([mg.in_degree(n) for n in comp]) == min_indegree][0]
     return sorted(list(smith))
 
-@vm_name("GETCHA")
+@vm_name("Top Cycle")
 def getcha(profile):
     """See the explanation of getcha_mg"""
     mg = generate_weak_margin_graph(profile)
     return getcha_mg(mg)
-
 
 @vm_name("GOCHA")
 def gocha_mg(mg):
@@ -950,16 +1507,78 @@ def ranked_pairs(profile):
     else:
         winners = list()            
         margins = sorted(list(set([e[2]['weight'] for e in wmg.edges(data=True)])), reverse=True)
-        sorted_edges = [[e for e in wmg.edges(data=True) if e[2]['weight'] == w] for w in margins]
+        sorted_edges = [[e for e in wmg.edges(data=True) if e[2]['weight'] == m] for m in margins]
         tbs = product(*[permutations(edges) for edges in sorted_edges])
         for tb in tbs:
             edges = flatten(tb)
             new_ranking = nx.DiGraph() 
             for e in edges: 
                 new_ranking.add_edge(e[0], e[1], weight=e[2]['weight'])
-                if  has_cycle(new_ranking):
+                if does_create_cycle(new_ranking, e):
                     new_ranking.remove_edge(e[0], e[1])
             winners.append(unbeaten_candidates(new_ranking)[0])
+    return sorted(list(set(winners)))
+
+@vm_name("Ranked Pairs ZT")
+def ranked_pairs_zt(profile):
+    '''Ranked pairs (see the ranked_pairs docstring for an explanation) where a fixed voter breaks 
+    any ties in the margins.  It is always the voter in position 0 that breaks the ties. 
+    Since voters have strict preferences, this method is resolute.  This is known as Ranked Pairs ZT, 
+    for Zavist Tideman 
+    '''
+    # the tie-breaker is always the first voter: 
+    tb_ranking = tuple(profile._rankings[0])
+    
+    wmg = generate_weak_margin_graph(profile)
+    cw = profile.condorcet_winner()
+
+    # Ranked Pairs is Condorcet consistent, so simply return the Condorcet winner if exists
+    if cw is not None: 
+        winners = [cw]
+    else:
+        winners = list() 
+        margins = sorted(list(set([e[2]['weight'] for e in wmg.edges(data=True)])), reverse=True)
+        rp_defeat = nx.DiGraph() 
+        for m in margins: 
+            edges = [e for e in wmg.edges(data=True) if e[2]['weight'] == m]
+            
+            # break ties using the lexicgraphic ordering on tuples given tb_ranking
+            sorted_edges = sorted(edges, key = lambda e: (tb_ranking.index(e[0]), tb_ranking.index(e[1])), reverse=False)
+            for e in sorted_edges: 
+                rp_defeat.add_edge(e[0], e[1], weight=e[2]['weight'])
+                if  does_create_cycle(rp_defeat, e):
+                    rp_defeat.remove_edge(e[0], e[1])
+        winners = unbeaten_candidates(rp_defeat)
+    return sorted(list(set(winners)))
+
+@vm_name("Ranked Pairs T")
+def ranked_pairs_t(profile, tiebreaker = None):
+    '''Ranked pairs (see the ranked_pairs docstring for an explanation) where a fixed linear order on the 
+    candidates to break any ties in the margins.  It is always the voter in position 0 that breaks the ties. 
+    Since voters have strict preferences, this method is resolute.
+    '''
+    
+    tb_ranking = tiebreaker if tiebreaker is not None else sorted(list(profile.candidates))
+    wmg = generate_weak_margin_graph(profile)
+    cw = profile.condorcet_winner()
+
+    # Ranked Pairs is Condorcet consistent, so simply return the Condorcet winner if exists
+    if cw is not None: 
+        winners = [cw]
+    else:
+        winners = list() 
+        margins = sorted(list(set([e[2]['weight'] for e in wmg.edges(data=True)])), reverse=True)
+        rp_defeat = nx.DiGraph() 
+        for m in margins: 
+            edges = [e for e in wmg.edges(data=True) if e[2]['weight'] == m]
+            
+            # break ties using the lexicgraphic ordering on tuples given tb_ranking
+            sorted_edges = sorted(edges, key = lambda e: (tb_ranking.index(e[0]), tb_ranking.index(e[1])), reverse=False)
+            for e in sorted_edges: 
+                rp_defeat.add_edge(e[0], e[1], weight=e[2]['weight'])
+                if  does_create_cycle(rp_defeat, e):
+                    rp_defeat.remove_edge(e[0], e[1])
+        winners = unbeaten_candidates(rp_defeat)
     return sorted(list(set(winners)))
 
 
@@ -1024,25 +1643,31 @@ def blacks(profile):
         
     return winners
 
-
-
 all_vms = [
     plurality,
     borda, 
     anti_plurality,
-    hare, 
+    hare,
+    hare_tb, 
+    hare_put,
     plurality_with_runoff,
     coombs,
     coombs_tb,
     coombs_put,
     baldwin,
+    baldwin_tb,
+    baldwin_put,
     strict_nanson, 
     weak_nanson,
+    bucklin,
+    simplified_bucklin,
     condorcet,
     copeland,
     llull,
     uc_gill,
     uc_fish,
+    uc_bordes,
+    uc_mckelvey,
     getcha,
     gocha,
     minimax, 
@@ -1051,9 +1676,11 @@ all_vms = [
     beat_path,
     beat_path_faster,
     ranked_pairs,
+    ranked_pairs_zt,
+    ranked_pairs_t,
     iterated_remove_cl,
     daunou,
-    blacks 
+    blacks
 ]
 
 all_vms_mg = [
@@ -1062,6 +1689,8 @@ all_vms_mg = [
     llull_mg,
     uc_gill_mg,
     uc_fish_mg,
+    uc_bordes_mg, 
+    uc_mckelvey,
     getcha_mg,
     gocha_mg
 ]

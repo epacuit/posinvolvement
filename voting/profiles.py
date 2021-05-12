@@ -323,7 +323,7 @@ class Profile(object):
         pos = nx.circular_layout(mg)
         nx.draw(mg, pos, 
                 font_size=20, node_color='blue', font_color='white', node_size=700, 
-                width=1, lw=1.5, with_labels=True)
+                width=1.5, with_labels=True)
         labels = nx.get_edge_attributes(mg,'weight')
         nx.draw_networkx_edge_labels(mg,pos,edge_labels=labels, label_pos=0.3)
         plt.show()

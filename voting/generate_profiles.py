@@ -5,7 +5,7 @@
     
     Functions to generate profile
     
-    Most of the functions interface with the preflib tools
+    Most of the functions to generate the profile are from the preflib tools (preflib.org)
     
     Main Functions
     --------------
@@ -15,33 +15,144 @@
 '''
 
 
-from .preflibtools.generate_profiles  import *
 from .profiles import Profile
 import numpy as np # for the SPATIAL model
+import math
+import random
 
 #############
 # wrapper functions to interface with preflib tools for generating profiles
 #############
 
-def create_rankings_mallows(num_voters, cmap, phi, ref=None):
-    '''create a profile using a mallows model with dispersion param phi
-    ref is the reference ranking.
-    
-    wrapper function to call the preflib function gen_mallows
-    '''
-    if ref == None:
-        ref, refc = gen_impartial_culture_strict(1, cmap)
-        
-    _rmaps, rcounts = gen_mallows(num_voters, cmap, [1.0], [phi], ref)
-    
-    # fix candidate names so that they range from 0 to num_cands-1 
-    # the preflib gen_mallows function returns candidate maps where candidates
-    # are named 1...num_cands
-    
-    rmaps = [{cname - 1: rank for cname,rank in _r.items()} for _r in _rmaps]
-    return  rmaps, rcounts
+### URN model ###
 
-def create_rankings_mallows_two_rankings(num_voters, cmap, phi, ref=None):
+# Generate votes based on the URN Model.
+# we need num_cands and num_voters  with replace replacements.
+# This function is a small modification of the same function used
+# in preflib.org to generate profiles 
+def gen_urn(num_cands, num_voters, replace):
+    
+    voteMap = {}
+    ReplaceVotes  = {}
+    
+    ICsize = math.factorial(num_cands)
+    ReplaceSize = 0
+
+    for x in range(num_voters):
+        flip =  random.randint(1, ICsize+ReplaceSize)
+        if flip <= ICsize:
+            #generate an IC vote and make a suitable number of replacements...
+            tvote = tuple(np.random.permutation(num_cands)) # gen_ic_vote(alts)
+            voteMap[tvote] = (voteMap.get(tvote, 0) + 1)
+            ReplaceVotes[tvote] = (ReplaceVotes.get(tvote, 0) + replace)
+            ReplaceSize += replace
+        else:
+            #iterate over replacement hash and select proper vote.
+            flip = flip - ICsize
+            for vote in ReplaceVotes.keys():
+                flip = flip - ReplaceVotes[vote]
+                if flip <= 0:
+                    voteMap[vote] = (voteMap.get(vote, 0) + 1)
+                    ReplaceVotes[vote] = (ReplaceVotes.get(vote, 0) + replace)
+                    ReplaceSize += replace
+                    break
+            else:
+                print("We Have a problem... replace fell through....")
+                exit()
+    return voteMap
+
+def create_rankings_urn(num_cands, num_voters, replace):
+    """create a list of rankings using the urn model
+    """
+    vote_map = gen_urn(num_cands, num_voters, replace)
+    return [vc[0] for vc in vote_map.items()], [vc[1] for vc in vote_map.items()]        
+
+
+
+#### Mallows Model ####
+
+# For Phi and a given number of candidates, compute the
+# insertion probability vectors.
+def compute_mallows_insertvec_dist(ncand, phi):
+    #Compute the Various Mallows Probability Distros
+    vec_dist = {}
+    for i in range(1, ncand+1):
+        #Start with an empty distro of length i
+        dist = [0] * i
+        #compute the denom = phi^0 + phi^1 + ... phi^(i-1)
+        denom = sum([pow(phi,k) for k in range(i)])
+        #Fill each element of the distro with phi^i-j / denom
+        for j in range(1, i+1):
+            dist[j-1] = pow(phi, i - j) / denom
+        #print(str(dist) + "total: " + str(sum(dist)))
+        vec_dist[i] = dist
+    return vec_dist
+
+# Return a value drawn from a particular distribution.
+def draw(values, distro):
+    #Return a value randomly from a given discrete distribution.
+    #This is a bit hacked together -- only need that the distribution
+    #sums to 1.0 within 5 digits of rounding.
+    if round(sum(distro),5) != 1.0:
+        print("Input Distro is not a Distro...")
+        print(str(distro) + "  Sum: " + str(sum(distro)))
+        exit()
+    if len(distro) != len(values):
+        print("Values and Distro have different length")
+
+    cv = 0
+    draw = random.random() - distro[cv]
+    while draw > 0.0:
+        cv+= 1
+        draw -= distro[cv]
+    return values[cv]
+
+# Generate a Mallows model with the various mixing parameters passed in
+# nvoters is the number of votes we need
+# candmap is a candidate map
+# mix is an array such that sum(mix) == 1 and describes the distro over the models
+# phis is an array len(phis) = len(mix) = len(refs) that is the phi for the particular model
+# refs is an array of dicts that describe the reference ranking for the set.
+def gen_mallows(num_cands, num_voters, mix, phis, refs):
+
+    if len(mix) != len(phis) or len(phis) != len(refs):
+        print("Mix != Phis != Refs")
+        exit()
+
+    #Precompute the distros for each Phi and Ref.
+    #Turn each ref into an order for ease of use...
+    m_insert_dists = []
+    for i in range(len(mix)):
+        m_insert_dists.append(compute_mallows_insertvec_dist(num_cands, phis[i]))
+    #Now, generate votes...
+    votemap = {}
+    for cvoter in range(num_voters):
+        cmodel = draw(list(range(len(mix))), mix)
+        #print("cmodel is ", cmodel)
+        #Generate a vote for the selected model
+        insvec = [0] * num_cands
+        for i in range(1, len(insvec)+1):
+            #options are 1...max
+            insvec[i-1] = draw(list(range(1, i+1)), m_insert_dists[cmodel][i])
+        vote = []
+        for i in range(len(refs[cmodel])):
+            #print("building vote insvec[i] - 1", insvec[i]-1)
+            vote.insert(insvec[i]-1, refs[cmodel][i])
+        tvote = tuple(vote)
+        
+        votemap[tuple(vote)] = votemap.get(tuple(vote), 0) + 1
+    return votemap
+
+def create_rankings_mallows(num_cands, num_voters, phi, ref=None):
+    
+    ref = tuple(np.random.permutation(num_cands))
+    
+    vote_map = gen_mallows(num_cands, num_voters, [1.0], [phi], [ref])
+    
+    return [vc[0] for vc in vote_map.items()], [vc[1] for vc in vote_map.items()]        
+
+
+def create_rankings_mallows_two_rankings(num_cands, num_voters, phi, ref=None):
     '''create a profile using a Mallows model with dispersion param phi
     ref is two linear orders that are reverses of each other 
     
@@ -49,64 +160,57 @@ def create_rankings_mallows_two_rankings(num_voters, cmap, phi, ref=None):
     
     '''
     
-    if ref == None:
-        ref, refc = gen_impartial_culture_strict(1, cmap)
-    ref1 = ref[0]
-    
-    # reverse the ref1 ranking
-    _rankings = [sorted(list(r.items()), key=lambda _r: _r[1]) for r in ref]
-    _ranking= [[_cr[0] for _cr in _crs] for _crs in _rankings] [0]
-    _ranking.reverse()
-    ref2 = {c:cidx+1 for cidx,c in enumerate(_ranking)}
+    ref = np.random.permutation(range(num_cands))
+    ref2 = ref[::-1]
 
-    _rmaps, rcount = gen_mallows(num_voters, cmap, [0.5, 0.5], [phi, phi], [ref1, ref2])
-    
-    # fix candidate names so that they range from 0 to num_cands-1 
-    # the preflib gen_mallows function returns candidate maps where candidates
-    # are named 1...num_cands
-    
-    rmaps = [{cname - 1: rank for cname,rank in _r.items()} for _r in _rmaps]
-    return rmaps, rcount
+    vote_map = gen_mallows(num_cands, num_voters, [0.5,0.5], [phi,phi], [ref,ref2])
+        
+    return [vc[0] for vc in vote_map.items()], [vc[1] for vc in vote_map.items()]        
 
-def create_rankings_urn(num_voters, cmap, replace):
-    """create a list of rankings using the urn model
-    
-    wrapper function to call the preflib function gen_urn_strict
-    """
 
-    return gen_urn_strict(num_voters, replace, cmap)        
 
-def create_rankings_single_peaked(num_voters, cmap, param):
+######
+# SinglePeaked
+######
+
+# Return a Tuple for a IC-Single Peaked... with alternatives in range 1....range.
+def gen_icsp_single_vote(alts):
+    a = 0
+    b = len(alts)-1
+    temp = []
+    while a != b:
+        if random.randint(0,1) == 1:
+            temp.append(alts[a])
+            a+= 1
+        else:
+            temp.append(alts[b])
+            b -= 1
+    temp.append(alts[a])
+    return tuple(temp[::-1]) # reverse
+
+
+def gen_single_peaked_impartial_culture_strict(nvotes, alts):
+    voteset = {}
+    for i in range(nvotes):
+        tvote = gen_icsp_single_vote(alts)
+        voteset[tvote] = voteset.get(tvote, 0) + 1
+    return voteset
+
+
+
+def create_rankings_single_peaked(num_cands, num_voters, param):
     """create a single-peaked list of rankings
     
     wrapper function to call the preflib function gen_single_peaked_impartial_culture_strict
     """
     
-    return gen_single_peaked_impartial_culture_strict(num_voters, cmap)
-
-def get_ranking(candidates):
-    '''get a ranking (using impartial culture) from a list of candidates'''
-    refm, refc = gen_impartial_culture_strict(1, {c:c for c in candidates})
-    return rmap_to_linear_rankings(refm)[0]
-
-def rmap_to_linear_rankings(rmaps): 
-    '''convert rmaps from preflib to a list of tuples
-    
-    The function assumes that rmaps represents linear orderings of the candidates
-    and that the names of the candidates are 1,2,...num_cands
-    
-    rmaps: dict
-        dictionary provided by preflib profile generation functions
-    '''
-    
-    _rankings = [sorted(list(r.items()), key=lambda _r: _r[1]) for r in rmaps]
-    return [tuple([_cr[0] for _cr in _crs]) for _crs in _rankings] 
-
+    vote_map = gen_single_peaked_impartial_culture_strict(num_voters, list(range(num_cands)))
+    return [vc[0] for vc in vote_map.items()], [vc[1] for vc in vote_map.items()]        
 
 ###########
 # generate profile using the spatial model
 ##########
-
+## TODO: Needs updated
 
 def voter_utility(v_pos, c_pos, beta):
     '''Based on the Rabinowitz and Macdonald (1989) mixed model
@@ -157,7 +261,7 @@ prob_models = {
     "MALLOWS_2REF": {"func": create_rankings_mallows_two_rankings, "param": 0.8}, 
     "URN": {"func": create_rankings_urn, "param": 10},
     "SinglePeaked": {"func": create_rankings_single_peaked, "param": None},
-    "SPATIAL": {"func": create_prof_spatial_model, "param": (3, 1.0)},
+    #"SPATIAL": {"func": create_prof_spatial_model, "param": (3, 1.0)},
 
 }
  
@@ -182,13 +286,10 @@ def generate_profile(num_cands, num_voters, probmod="IC", probmod_param=None):
         alternative parameter for the different models (e.g., different dispersion parameter for Mallows)
     '''
     # candidates names must be 0,..., num_cands - 1
-    cmap = {cn:cn for cn in range(num_cands)}
     create_rankings = prob_models[probmod]["func"]
-    probmod_p = prob_models[probmod]["param"] if  probmod_param is None else probmod_param 
+    probmod_param = prob_models[probmod]["param"] if  probmod_param is None else probmod_param 
     
     # use preflib tools to generate the rankings
-    rmaps, rmapscounts = create_rankings(num_voters, cmap, probmod_p) 
+    rankings, rcounts = create_rankings(num_cands, num_voters, probmod_param) 
     
-    # the SPATIAL model creates a list of tuples, but the preflib functions creates a list of dictionaries
-    rankings = rmap_to_linear_rankings(rmaps) if probmod != "SPATIAL" else rmaps 
-    return Profile(rankings, num_cands, rcounts=rmapscounts)
+    return Profile(rankings, num_cands, rcounts = rcounts)

@@ -41,8 +41,11 @@ from voting.voting_methods import *
 prof = Profile(rankings, num_cands, rcounts=rcounts)
 print(f"The {borda.name} winners are {borda(prof)}")
 ```
-4. See 03-PI_instances.ipynb for the code to measure the vioaltions of positive invovlement.  
+4. See 03-Measuring_PI_violations.ipynb for the code to measure the vioaltions of positive invovlement.  
 
+5. See 04-Visualizing_measures_PI_violations.ipynb for the code to generate the graphs from the paper.  
+
+6. See 05-PI_instances.ipynb for instances of violations of positive involvement.  
 
 
 ## Dev Notes
@@ -55,15 +58,13 @@ print(f"The {borda.name} winners are {borda(prof)}")
 
 ## Other Files/Directories
 
-1. voting/profiles.py: Implementation of the Profile class used to create and reason about profile (see Profile.ipynb for an overview).
+1. voting/profiles.py: Implementation of the Profile class used to create and reason about profile (see 01-Profile.ipynb for an overview).
 
-2. voting/voting_methods.py: Implemenations of the voting methods (see VotingMethods.ipynb for an overview).
+2. voting/voting_methods.py: Implemenations of the voting methods (see 02-VotingMethods.ipynb for an overview).
 
-3. voting/generate_profiles.py: Implementation of  the funciton `generate_profile` to interface with the Preflib tools to generate profiles according to different probability models. 
+3. voting/generate_profiles.py: Implementation of  the funciton `generate_profile` to interface with the Preflib tools to generate profiles according to different probability models.   The code go generate profiles according to differnet probability models  is based on the [Preflib tools](https://github.com/PrefLib/PrefLib-Tools) used to genreate profiles according to different probability models. 
 
-4. voting/preflibtools/: The [Preflib tools](https://github.com/PrefLib/PrefLib-Tools) used to genreate profiles according to different probability models. 
-
-5. from_aws/: Output of the simulations run on AWS to produce the figures in the paper. 
+5. data/: Output of the simulations run on AWS to produce the figures in the paper. 
 
 6. graphs_tark/: pdfs of the graphs from the paper.
 
@@ -73,11 +74,10 @@ print(f"The {borda.name} winners are {borda(prof)}")
 
 All the code is written in Python 3. 
 
-- [Preflib tools](https://github.com/PrefLib/PrefLib-Tools) (available in the voting/preflibtools directory)
 - The notebooks and most of the library is built around a full SciPy stack: [MatPlotLib](https://matplotlib.org/), [Numpy](https://numpy.org/), [Pandas](https://pandas.pydata.org/)
 - [numba](http://numba.pydata.org/) 
 - [networkx](https://networkx.org/)
 - [tabulate](https://github.com/astanin/python-tabulate)
 - [seaborn](https://seaborn.pydata.org/)  
-- [multiprocess](https://pypi.org/project/multiprocess/) (only needed if running the simulations in  05-ProbabilisticStabilityWinners.ipynb) 
+- [multiprocess](https://pypi.org/project/multiprocess/) (only needed if running the simulations in  03-PI_instances.ipynb) 
 - [tqdm.notebook](https://github.com/tqdm/tqdm)
